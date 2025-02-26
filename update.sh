@@ -9,14 +9,21 @@ readonly NC='\033[0m' # No Color (for terminal output)
 
 # 获取 RustDesk Server 的最新版本
 get_latest_rustdesk_version() {
-  curl -s "https://api.github.com/repos/rustdesk/rustdesk-server/releases/latest" | \
-  jq -r '.tag_name'
+  local response=$(curl -s -f "https://api.github.com/repos/rustdesk/rustdesk-server/releases/latest")
+  if [ $? -ne 0 ]; then
+    echo "Error: Failed to fetch latest RustDesk Server version from GitHub." >&2
+    exit 1
+  fi
+  echo "$response" | jq -r '.tag_name'
 }
 
 # 获取当前已安装的 RustDesk Server 版本
 get_current_rustdesk_version() {
-  if [ -d "$RUSTDESK_DIR" ] && command -v "$RUSTDESK_DIR/hbbr" >/dev/null 2>&1; then
-      "$RUSTDESK_DIR/hbbr" --version 2>/dev/null | awk '{print $2}'
+    # 更安全的查找 hbbr 的方式, 避免全局查找
+   local hbbr_path=$(find "$RUSTDESK_DIR" -name hbbr -type f 2>/dev/null | head -n 1)
+
+  if [ -n "$hbbr_path" ] && [ -x "$hbbr_path" ]; then  # 检查是否可执行
+      "$hbbr_path" --version 2>/dev/null | awk '{print $2}'
   else
     echo ""  # 返回空字符串，表示未安装
   fi
@@ -24,8 +31,12 @@ get_current_rustdesk_version() {
 
 # 获取 gohttpserver 的最新版本
 get_latest_gohttp_version() {
-    curl -s "https://api.github.com/repos/codeskyblue/gohttpserver/releases/latest" | \
-    jq -r '.tag_name'
+   local response=$(curl -s -f "https://api.github.com/repos/codeskyblue/gohttpserver/releases/latest")
+  if [ $? -ne 0 ]; then  # 检查 curl 是否成功
+    echo "Error: Failed to fetch latest gohttpserver version from GitHub." >&2
+    exit 1
+  fi
+    echo "$response" | jq -r '.tag_name'
 }
 
 
