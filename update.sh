@@ -1,155 +1,236 @@
 #!/bin/bash
 
-# Get Username
-uname=$(whoami) # not used btw .. yet
+set -euo pipefail  # 开启更严格的 shell 选项
 
-# Get current release version
-RDLATEST=$(curl https://api.github.com/repos/rustdesk/rustdesk-server/releases/latest -s | grep "tag_name" | awk -F'"' '{print $4}')
-RDCURRENT=$(/opt/rustdesk/hbbr --version | sed -r 's/hbbr (.*)/\1/')
+# 常量定义
+readonly RUSTDESK_DIR="/opt/rustdesk"
+readonly GOHTTP_DIR="/opt/gohttp"
+readonly NC='\033[0m' # No Color (for terminal output)
 
-if [ $RDLATEST == $RDCURRENT ]; then
-    echo "Same version no need to update."
-    exit 0
-fi
+# 获取 RustDesk Server 的最新版本
+get_latest_rustdesk_version() {
+  curl -s "https://api.github.com/repos/rustdesk/rustdesk-server/releases/latest" | \
+  jq -r '.tag_name'
+}
 
-sudo systemctl stop gohttpserver.service
-sudo systemctl stop rustdesksignal.service
-sudo systemctl stop rustdeskrelay.service
+# 获取当前已安装的 RustDesk Server 版本
+get_current_rustdesk_version() {
+  if [ -d "$RUSTDESK_DIR" ] && command -v "$RUSTDESK_DIR/hbbr" >/dev/null 2>&1; then
+      "$RUSTDESK_DIR/hbbr" --version 2>/dev/null | awk '{print $2}'
+  else
+    echo ""  # 返回空字符串，表示未安装
+  fi
+}
 
-ARCH=$(uname -m)
+# 获取 gohttpserver 的最新版本
+get_latest_gohttp_version() {
+    curl -s "https://api.github.com/repos/codeskyblue/gohttpserver/releases/latest" | \
+    jq -r '.tag_name'
+}
 
-# identify OS
-if [ -f /etc/os-release ]; then
-    # freedesktop.org and systemd
+
+# 停止服务
+stop_services() {
+  sudo systemctl stop gohttpserver.service 2>/dev/null || true
+  sudo systemctl stop rustdesksignal.service 2>/dev/null || true
+  sudo systemctl stop rustdeskrelay.service 2>/dev/null || true
+}
+
+# 启动服务
+start_services() {
+    sudo systemctl start rustdesksignal.service
+    sudo systemctl start rustdeskrelay.service
+
+     # Wait for rustdeskrelay to be ready.  Simpler loop.
+    while ! sudo systemctl is-active --quiet rustdeskrelay.service; do
+      echo -ne "Rustdesk Relay not ready yet...\n"
+      sleep 3
+    done
+
+    sudo systemctl start gohttpserver.service
+}
+
+
+# 获取操作系统信息
+get_os_info() {
+  local os_name=""
+  local os_version=""
+  local upstream_id=""
+
+  if [ -f /etc/os-release ]; then
     . /etc/os-release
-    OS=$NAME
-    VER=$VERSION_ID
-    UPSTREAM_ID=${ID_LIKE,,}
-    # Fallback to ID_LIKE if ID was not 'ubuntu' or 'debian'
-    if [ "${UPSTREAM_ID}" != "debian" ] && [ "${UPSTREAM_ID}" != "ubuntu" ]; then
-        UPSTREAM_ID="$(echo ${ID_LIKE,,} | sed s/\"//g | cut -d' ' -f1)"
+    os_name="$NAME"
+    os_version="$VERSION_ID"
+    upstream_id="${ID_LIKE:-$ID}"  # Use ID_LIKE if available, otherwise ID
+    upstream_id=${upstream_id,,}   # Lowercase
+
+  elif type lsb_release >/dev/null 2>&1; then
+    os_name=$(lsb_release -si)
+    os_version=$(lsb_release -sr)
+  elif [ -f /etc/lsb-release ]; then
+    . /etc/lsb-release
+    os_name=$DISTRIB_ID
+    os_version=$DISTRIB_RELEASE
+  elif [ -f /etc/debian_version ]; then
+    os_name=Debian
+    os_version=$(cat /etc/debian_version)
+  elif [ -f /etc/SuSe-release ]; then
+    os_name=SuSE
+    os_version=$(cat /etc/SuSe-release)
+  elif [ -f /etc/redhat-release ]; then
+    os_name=RedHat
+    os_version=$(cat /etc/redhat-release)
+  else
+    os_name=$(uname -s)
+    os_version=$(uname -r)
+  fi
+
+  echo "$os_name" "$os_version" "$upstream_id"
+}
+
+# 安装依赖
+install_dependencies() {
+  local os_name="$1"
+  local upstream_id="$2"
+
+  local prereq="curl wget unzip tar"
+  local prereq_deb="dnsutils"
+  local prereq_rpm="bind-utils"
+
+  echo "Installing prerequisites..."
+
+  if [[ "$os_name" == "Debian" || "$os_name" == "Ubuntu" || "$upstream_id" == "debian" || "$upstream_id" == "ubuntu" ]]; then
+    sudo apt-get update
+    sudo apt-get install -y "$prereq" "$prereq_deb"
+  elif [[ "$os_name" == "CentOS" || "$os_name" == "RedHat" || "$upstream_id" == "rhel" ]]; then
+    sudo yum update -y
+    sudo yum install -y "$prereq" "$prereq_rpm"
+  elif [[ "$upstream_id" == "arch" ]]; then
+    sudo pacman -Syu
+    sudo pacman -S "$prereq"  # Assuming prereq_arch is defined, or use a common list
+  else
+     echo "Unsupported OS: $os_name"
+     echo "Currently supported: Debian, Ubuntu, CentOS, RedHat, Arch Linux"
+     exit 1
+  fi
+}
+
+# 更新 RustDesk Server
+update_rustdesk() {
+    local latest_version="$1"
+    local arch="$(uname -m)"
+
+    cd "$RUSTDESK_DIR" || { echo "Error: Could not cd to $RUSTDESK_DIR"; exit 1; }
+    rm -f *.zip
+
+    echo "Upgrading Rustdesk Server to version: $latest_version"
+
+    local download_url=""
+    local archive_name=""
+
+     case "$arch" in
+        x86_64)
+          download_url="https://github.com/rustdesk/rustdesk-server/releases/download/${latest_version}/rustdesk-server-linux-amd64.zip"
+          archive_name="rustdesk-server-linux-amd64.zip"
+          ;;
+        armv7l)
+          download_url="https://github.com/rustdesk/rustdesk-server/releases/download/${latest_version}/rustdesk-server-linux-armv7.zip"
+           archive_name="rustdesk-server-linux-armv7.zip"
+          ;;
+        aarch64)
+          download_url="https://github.com/rustdesk/rustdesk-server/releases/download/${latest_version}/rustdesk-server-linux-arm64v8.zip"
+          archive_name="rustdesk-server-linux-arm64v8.zip"
+          ;;
+        *)
+          echo "Unsupported architecture: $arch"
+          exit 1
+          ;;
+      esac
+
+    wget "$download_url" -O "$archive_name" || { echo "Download failed."; exit 1; }
+    unzip -j -o "$archive_name" "*/hbbs" "*/hbbr" -d "$RUSTDESK_DIR" || { echo "Unzip failed."; exit 1; }
+    rm -f "$archive_name"
+
+}
+
+# 更新 gohttpserver
+update_gohttp() {
+    local latest_version="$1"
+    local arch="$(uname -m)"
+
+    if [ ! -f "$GOHTTP_DIR/gohttpserver" ]; then
+      echo "gohttpserver is not installed. Skipping update."
+      return
     fi
 
-elif type lsb_release >/dev/null 2>&1; then
-    # linuxbase.org
-    OS=$(lsb_release -si)
-    VER=$(lsb_release -sr)
-elif [ -f /etc/lsb-release ]; then
-    # For some versions of Debian/Ubuntu without lsb_release command
-    . /etc/lsb-release
-    OS=$DISTRIB_ID
-    VER=$DISTRIB_RELEASE
-elif [ -f /etc/debian_version ]; then
-    # Older Debian/Ubuntu/etc.
-    OS=Debian
-    VER=$(cat /etc/debian_version)
-elif [ -f /etc/SuSe-release ]; then
-    # Older SuSE/etc.
-    OS=SuSE
-    VER=$(cat /etc/SuSe-release)
-elif [ -f /etc/redhat-release ]; then
-    # Older Red Hat, CentOS, etc.
-    OS=RedHat
-    VER=$(cat /etc/redhat-release)
-else
-    # Fall back to uname, e.g. "Linux <version>", also works for BSD, etc.
-    OS=$(uname -s)
-    VER=$(uname -r)
-fi
+    cd "$GOHTTP_DIR" || { echo "Error: Could not cd to $GOHTTP_DIR"; exit 1; }
+    
+    local download_url=""
+    local archive_name=""
+
+    case "$arch" in
+      x86_64)
+          download_url="https://github.com/codeskyblue/gohttpserver/releases/download/${latest_version}/gohttpserver_${latest_version}_linux_amd64.tar.gz"
+          archive_name="gohttpserver_${latest_version}_linux_amd64.tar.gz"
+          ;;
+      aarch64)
+           download_url="https://github.com/codeskyblue/gohttpserver/releases/download/${latest_version}/gohttpserver_${latest_version}_linux_arm64.tar.gz"
+          archive_name="gohttpserver_${latest_version}_linux_arm64.tar.gz"
+          ;;
+      armv7l)
+          echo "Go HTTP Server not supported on 32bit ARM devices"
+          exit 1
+          ;;
+      *)
+          echo "Unsupported architecture: $arch"
+          exit 1
+          ;;
+    esac
+
+    wget "$download_url" -O "$archive_name" || { echo "Download failed."; exit 1;}
+    tar -xf "$archive_name" || { echo "Extraction failed."; exit 1;}
+    rm -f "$archive_name"
+
+}
 
 
-# output ebugging info if $DEBUG set
-if [ "$DEBUG" = "true" ]; then
-    echo "OS: $OS"
-    echo "VER: $VER"
-    echo "UPSTREAM_ID: $UPSTREAM_ID"
+
+# 主逻辑
+main() {
+  read -r os_name os_version upstream_id <<< "$(get_os_info)"
+
+  if [ "$DEBUG" = "true" ]; then
+    echo "OS: $os_name"
+    echo "VER: $os_version"
+    echo "UPSTREAM_ID: $upstream_id"
     exit 0
-fi
+  fi
+
+  install_dependencies "$os_name" "$upstream_id"
+
+  local latest_rustdesk_version="$(get_latest_rustdesk_version)"
+  local current_rustdesk_version="$(get_current_rustdesk_version)"
+
+  stop_services
+
+    if [ "$latest_rustdesk_version" != "$current_rustdesk_version" ]; then
+        if [ ! -d "$RUSTDESK_DIR" ]; then
+          echo "RustDesk directory not found.  Run install.sh first."
+          exit 1
+        fi
+
+        update_rustdesk "$latest_rustdesk_version"
+    else
+        echo "RustDesk Server is up to date."
+    fi
+
+  local latest_gohttp_version="$(get_latest_gohttp_version)"
+  update_gohttp "$latest_gohttp_version"
+
+  start_services
 
 
-# Setup prereqs for server
-# common named prereqs
-PREREQ="curl wget unzip tar"
-PREREQDEB="dnsutils"
-PREREQRPM="bind-utils"
+  echo "Updates are complete."
+}
 
-echo "Installing prerequisites"
-if [ "${ID}" = "debian" ] || [ "$OS" = "Ubuntu" ] || [ "$OS" = "Debian" ]  || [ "${UPSTREAM_ID}" = "ubuntu" ] || [ "${UPSTREAM_ID}" = "debian" ]; then
-    sudo apt-get update
-    sudo apt-get install -y  ${PREREQ} ${PREREQDEB} # git
-elif [ "$OS" = "CentOS" ] || [ "$OS" = "RedHat" ]   || [ "${UPSTREAM_ID}" = "rhel" ] ; then
-# opensuse 15.4 fails to run the relay service and hangs waiting for it
-# needs more work before it can be enabled
-# || [ "${UPSTREAM_ID}" = "suse" ]
-    sudo yum update -y
-    sudo yum install -y  ${PREREQ} ${PREREQRPM} # git
-elif [ "${ID}" = "arch" ] || [ "${UPSTREAM_ID}" = "arch" ]; then
-    sudo pacman -Syu
-    sudo pacman -S ${PREREQ} ${PREREQARCH}
-else
-    echo "Unsupported OS"
-    # here you could ask the user for permission to try and install anyway
-    # if they say yes, then do the install
-    # if they say no, exit the script
-    exit 1
-fi
-
-
-if ! [ -e /opt/rustdesk  ]; then
-        echo "No directory /opt/rustdesk found. No update of rustdesk possible (used install.sh script ?) "
-        exit 4
-else
-        :
-fi
-
-cd /opt/rustdesk/
-
-# remove any previous zip files
-rm *.zip
-
-echo "Upgrading Rustdesk Server"
-if [ "${ARCH}" = "x86_64" ] ; then
-wget "https://github.com/rustdesk/rustdesk-server/releases/download/${RDLATEST}/rustdesk-server-linux-amd64.zip"
-unzip -j -o  rustdesk-server-linux-amd64.zip  "amd64/*" -d "/opt/rustdesk/"
-elif [ "${ARCH}" = "armv7l" ] ; then
-wget "https://github.com/rustdesk/rustdesk-server/releases/download/${RDLATEST}/rustdesk-server-linux-armv7.zip"
-unzip -j -o  rustdesk-server-linux-armv7.zip  "armv7/*" -d "/opt/rustdesk/"
-elif [ "${ARCH}" = "aarch64" ] ; then
-wget "https://github.com/rustdesk/rustdesk-server/releases/download/${RDLATEST}/rustdesk-server-linux-arm64v8.zip"
-unzip -j -o  rustdesk-server-linux-arm64v8.zip  "arm64v8/*" -d "/opt/rustdesk/"
-fi
-
-sudo systemctl start rustdesksignal.service
-sudo systemctl start rustdeskrelay.service
-
-while ! [[ $CHECK_RUSTDESK_READY ]]; do
-  CHECK_RUSTDESK_READY=$(sudo systemctl status rustdeskrelay.service | grep "Active: active (running)")
-  echo -ne "Rustdesk Relay not ready yet...${NC}\n"
-  sleep 3
-done
-
-# chk if gotthp exists
-
-if ! [ -e /opt/gohttp ]; then
-        echo "No directory /opt/gohttp found. No update of gothhtp necessary."
-        exit 4
-else
-        :
-fi
-
-cd /opt/gohttp
-GOHTTPLATEST=$(curl https://api.github.com/repos/codeskyblue/gohttpserver/releases/latest -s | grep "tag_name"| awk '{print substr($2, 2, length($2)-3) }')
-if [ "${ARCH}" = "x86_64" ] ; then
-wget "https://github.com/codeskyblue/gohttpserver/releases/download/${GOHTTPLATEST}/gohttpserver_${GOHTTPLATEST}_linux_amd64.tar.gz"
-tar -xf  gohttpserver_${GOHTTPLATEST}_linux_amd64.tar.gz 
-elif [ "${ARCH}" =  "aarch64" ] ; then
-wget "https://github.com/codeskyblue/gohttpserver/releases/download/${GOHTTPLATEST}/gohttpserver_${GOHTTPLATEST}_linux_arm64.tar.gz"
-tar -xf  gohttpserver_${GOHTTPLATEST}_linux_arm64.tar.gz
-elif [ "${ARCH}" = "armv7l" ] ; then
-echo "Go HTTP Server not supported on 32bit ARM devices"
-exit 1
-fi
-
-sudo systemctl start gohttpserver.service
-
-echo -e "Updates are complete"
+main "$@"
