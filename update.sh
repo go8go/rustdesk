@@ -9,12 +9,13 @@ readonly NC='\033[0m' # No Color (for terminal output)
 
 # 获取 RustDesk Server 的最新版本
 get_latest_rustdesk_version() {
-  local response=$(curl -s -f "https://api.github.com/repos/rustdesk/rustdesk-server/releases/latest")
-  if [ $? -ne 0 ]; then
-    echo "Error: Failed to fetch latest RustDesk Server version from GitHub." >&2
+  local response=$(curl -s -S -f -o /dev/null -w "%{http_code}" "https://api.github.com/repos/rustdesk/rustdesk-server/releases/latest")
+  if [ "$response" == "200" ]; then
+    curl -s "https://api.github.com/repos/rustdesk/rustdesk-server/releases/latest" | jq -r '.tag_name'
+  else
+    echo "Error: Failed to fetch latest RustDesk Server version from GitHub. HTTP Status Code: $response" >&2
     exit 1
   fi
-  echo "$response" | jq -r '.tag_name'
 }
 
 # 获取当前已安装的 RustDesk Server 版本
@@ -31,12 +32,13 @@ get_current_rustdesk_version() {
 
 # 获取 gohttpserver 的最新版本
 get_latest_gohttp_version() {
-   local response=$(curl -s -f "https://api.github.com/repos/codeskyblue/gohttpserver/releases/latest")
-  if [ $? -ne 0 ]; then  # 检查 curl 是否成功
-    echo "Error: Failed to fetch latest gohttpserver version from GitHub." >&2
+  local response=$(curl -s -S -f -o /dev/null -w "%{http_code}" "https://api.github.com/repos/codeskyblue/gohttpserver/releases/latest")
+  if [ "$response" == "200" ]; then
+    curl -s "https://api.github.com/repos/codeskyblue/gohttpserver/releases/latest" | jq -r '.tag_name'
+  else
+    echo "Error: Failed to fetch latest gohttpserver version from GitHub. HTTP Status Code: $response" >&2
     exit 1
   fi
-    echo "$response" | jq -r '.tag_name'
 }
 
 
